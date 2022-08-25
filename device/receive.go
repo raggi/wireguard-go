@@ -10,7 +10,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,7 +27,6 @@ type QueueHandshakeElement struct {
 }
 
 type QueueInboundElement struct {
-	sync.Mutex
 	buffer   *[MaxMessageSize]byte
 	packet   []byte
 	counter  uint64
@@ -71,7 +69,6 @@ func (device *Device) RoutineReceiveIncoming(recv conn.ReceiveFunc) {
 	recvName := recv.PrettyName()
 	defer func() {
 		device.log.Verbosef("Routine: receive incoming %s - stopped", recvName)
-		device.queue.decryption.wg.Done()
 		device.queue.handshake.wg.Done()
 		device.net.stopping.Done()
 	}()
@@ -159,13 +156,10 @@ func (device *Device) RoutineReceiveIncoming(recv conn.ReceiveFunc) {
 			elem.keypair = keypair
 			elem.endpoint = endpoint
 			elem.counter = 0
-			elem.Mutex = sync.Mutex{}
-			elem.Lock()
 
 			// add to decryption queues
 			if peer.isRunning.Get() {
 				peer.queue.inbound.c <- elem
-				device.queue.decryption.c <- elem
 				buffer = device.GetMessageBuffer()
 			} else {
 				device.PutInboundElement(elem)
@@ -202,41 +196,11 @@ func (device *Device) RoutineReceiveIncoming(recv conn.ReceiveFunc) {
 	}
 }
 
-func (device *Device) RoutineDecryption(id int) {
-	var nonce [chacha20poly1305.NonceSize]byte
-
-	defer device.log.Verbosef("Routine: decryption worker %d - stopped", id)
-	device.log.Verbosef("Routine: decryption worker %d - started", id)
-
-	for elem := range device.queue.decryption.c {
-		// split message into fields
-		counter := elem.packet[MessageTransportOffsetCounter:MessageTransportOffsetContent]
-		content := elem.packet[MessageTransportOffsetContent:]
-
-		// decrypt and release to consumer
-		var err error
-		elem.counter = binary.LittleEndian.Uint64(counter)
-		// copy counter to nonce
-		binary.LittleEndian.PutUint64(nonce[0x4:0xc], elem.counter)
-		elem.packet, err = elem.keypair.receive.Open(
-			content[:0],
-			nonce[:],
-			content,
-			nil,
-		)
-		if err != nil {
-			elem.packet = nil
-		}
-		elem.Unlock()
-	}
-}
-
 /* Handles incoming packets related to handshake
  */
 func (device *Device) RoutineHandshake(id int) {
 	defer func() {
 		device.log.Verbosef("Routine: handshake worker %d - stopped", id)
-		device.queue.encryption.wg.Done()
 	}()
 	device.log.Verbosef("Routine: handshake worker %d - started", id)
 
@@ -402,13 +366,29 @@ func (peer *Peer) RoutineSequentialReceiver() {
 	}()
 	device.log.Verbosef("%v - Routine: sequential receiver - started", peer)
 
+	var nonce [chacha20poly1305.NonceSize]byte
+
 	for elem := range peer.queue.inbound.c {
 		if elem == nil {
 			return
 		}
+
+		// split message into fields
+		counter := elem.packet[MessageTransportOffsetCounter:MessageTransportOffsetContent]
+		content := elem.packet[MessageTransportOffsetContent:]
+
+		// decrypt and release to consumer
 		var err error
-		elem.Lock()
-		if elem.packet == nil {
+		elem.counter = binary.LittleEndian.Uint64(counter)
+		// copy counter to nonce
+		binary.LittleEndian.PutUint64(nonce[0x4:0xc], elem.counter)
+		elem.packet, err = elem.keypair.receive.Open(
+			content[:0],
+			nonce[:],
+			content,
+			nil,
+		)
+		if err != nil {
 			// decryption failed
 			goto skip
 		}

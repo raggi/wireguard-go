@@ -6,7 +6,6 @@
 package device
 
 import (
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -75,9 +74,7 @@ type Device struct {
 	}
 
 	queue struct {
-		encryption *outboundQueue
-		decryption *inboundQueue
-		handshake  *handshakeQueue
+		handshake *handshakeQueue
 	}
 
 	tun struct {
@@ -302,22 +299,15 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	// create queues
 
 	device.queue.handshake = newHandshakeQueue()
-	device.queue.encryption = newOutboundQueue()
-	device.queue.decryption = newInboundQueue()
 
 	// start workers
 
-	cpus := runtime.NumCPU()
 	device.state.stopping.Wait()
-	device.queue.encryption.wg.Add(cpus) // One for each RoutineHandshake
-	for i := 0; i < cpus; i++ {
-		go device.RoutineEncryption(i + 1)
-		go device.RoutineDecryption(i + 1)
-		go device.RoutineHandshake(i + 1)
-	}
 
-	device.state.stopping.Add(1)      // RoutineReadFromTUN
-	device.queue.encryption.wg.Add(1) // RoutineReadFromTUN
+	// TODO(raggi): cleanup
+	go device.RoutineHandshake(1)
+
+	device.state.stopping.Add(1) // RoutineReadFromTUN
 	go device.RoutineReadFromTUN()
 	go device.RoutineTUNEventReader()
 
@@ -372,8 +362,6 @@ func (device *Device) Close() {
 	// We kept a reference to the encryption and decryption queues,
 	// in case we started any new peers that might write to them.
 	// No new peers are coming; we are done with these queues.
-	device.queue.encryption.wg.Done()
-	device.queue.decryption.wg.Done()
 	device.queue.handshake.wg.Done()
 	device.state.stopping.Wait()
 
@@ -507,8 +495,7 @@ func (device *Device) BindUpdate() error {
 
 	// start receiving routines
 	device.net.stopping.Add(len(recvFns))
-	device.queue.decryption.wg.Add(len(recvFns)) // each RoutineReceiveIncoming goroutine writes to device.queue.decryption
-	device.queue.handshake.wg.Add(len(recvFns))  // each RoutineReceiveIncoming goroutine writes to device.queue.handshake
+	device.queue.handshake.wg.Add(len(recvFns)) // each RoutineReceiveIncoming goroutine writes to device.queue.handshake
 	for _, fn := range recvFns {
 		go device.RoutineReceiveIncoming(fn)
 	}

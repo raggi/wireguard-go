@@ -11,7 +11,6 @@ import (
 	"errors"
 	"net"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -45,7 +44,6 @@ import (
  */
 
 type QueueOutboundElement struct {
-	sync.Mutex
 	buffer  *[MaxMessageSize]byte // slice holding the packet data
 	packet  []byte                // slice of "buffer" (always!)
 	nonce   uint64                // nonce for encryption
@@ -56,7 +54,6 @@ type QueueOutboundElement struct {
 func (device *Device) NewOutboundElement() *QueueOutboundElement {
 	elem := device.GetOutboundElement()
 	elem.buffer = device.GetMessageBuffer()
-	elem.Mutex = sync.Mutex{}
 	elem.nonce = 0
 	// keypair and peer were cleared (if necessary) by clearPointers.
 	return elem
@@ -208,7 +205,6 @@ func (device *Device) RoutineReadFromTUN() {
 	defer func() {
 		device.log.Verbosef("Routine: TUN reader - stopped")
 		device.state.stopping.Done()
-		device.queue.encryption.wg.Done()
 	}()
 
 	device.log.Verbosef("Routine: TUN reader - started")
@@ -226,6 +222,7 @@ func (device *Device) RoutineReadFromTUN() {
 
 		offset := MessageTransportHeaderSize
 		size, err := device.tun.device.Read(elem.buffer[:], offset)
+
 		if err != nil {
 			if !device.isClosed() {
 				if !errors.Is(err, os.ErrClosed) {
@@ -317,12 +314,10 @@ top:
 			}
 
 			elem.keypair = keypair
-			elem.Lock()
 
 			// add to parallel and sequential queue
 			if peer.isRunning.Get() {
 				peer.queue.outbound.c <- elem
-				peer.device.queue.encryption.c <- elem
 			} else {
 				peer.device.PutMessageBuffer(elem.buffer)
 				peer.device.PutOutboundElement(elem)
@@ -360,19 +355,38 @@ func calculatePaddingSize(packetSize, mtu int) int {
 	return paddedSize - lastUnit
 }
 
-/* Encrypts the elements in the queue
- * and marks them for sequential consumption (by releasing the mutex)
+/* Sequentially reads packets from queue and sends to endpoint
  *
- * Obs. One instance per core
+ * Obs. Single instance per peer.
+ * The routine terminates then the outbound queue is closed.
  */
-func (device *Device) RoutineEncryption(id int) {
-	var paddingZeros [PaddingMultiple]byte
-	var nonce [chacha20poly1305.NonceSize]byte
+func (peer *Peer) RoutineSequentialSender() {
+	device := peer.device
+	defer func() {
+		defer device.log.Verbosef("%v - Routine: sequential sender - stopped", peer)
+		peer.stopping.Done()
+	}()
+	device.log.Verbosef("%v - Routine: sequential sender - started", peer)
 
-	defer device.log.Verbosef("Routine: encryption worker %d - stopped", id)
-	device.log.Verbosef("Routine: encryption worker %d - started", id)
+	for elem := range peer.queue.outbound.c {
+		if elem == nil {
+			return
+		}
+		if !peer.isRunning.Get() {
+			// peer has been stopped; return re-usable elems to the shared pool.
+			// This is an optimization only. It is possible for the peer to be stopped
+			// immediately after this check, in which case, elem will get processed.
+			// The timers and SendBuffer code are resilient to a few stragglers.
+			// TODO: rework peer shutdown order to ensure
+			// that we never accidentally keep timers alive longer than necessary.
+			device.PutMessageBuffer(elem.buffer)
+			device.PutOutboundElement(elem)
+			continue
+		}
 
-	for elem := range device.queue.encryption.c {
+		var paddingZeros [PaddingMultiple]byte
+		var nonce [chacha20poly1305.NonceSize]byte
+
 		// populate header fields
 		header := elem.buffer[:MessageTransportHeaderSize]
 
@@ -397,39 +411,6 @@ func (device *Device) RoutineEncryption(id int) {
 			elem.packet,
 			nil,
 		)
-		elem.Unlock()
-	}
-}
-
-/* Sequentially reads packets from queue and sends to endpoint
- *
- * Obs. Single instance per peer.
- * The routine terminates then the outbound queue is closed.
- */
-func (peer *Peer) RoutineSequentialSender() {
-	device := peer.device
-	defer func() {
-		defer device.log.Verbosef("%v - Routine: sequential sender - stopped", peer)
-		peer.stopping.Done()
-	}()
-	device.log.Verbosef("%v - Routine: sequential sender - started", peer)
-
-	for elem := range peer.queue.outbound.c {
-		if elem == nil {
-			return
-		}
-		elem.Lock()
-		if !peer.isRunning.Get() {
-			// peer has been stopped; return re-usable elems to the shared pool.
-			// This is an optimization only. It is possible for the peer to be stopped
-			// immediately after this check, in which case, elem will get processed.
-			// The timers and SendBuffer code are resilient to a few stragglers.
-			// TODO: rework peer shutdown order to ensure
-			// that we never accidentally keep timers alive longer than necessary.
-			device.PutMessageBuffer(elem.buffer)
-			device.PutOutboundElement(elem)
-			continue
-		}
 
 		peer.timersAnyAuthenticatedPacketTraversal()
 		peer.timersAnyAuthenticatedPacketSent()
